@@ -28,13 +28,13 @@ public class Redbird {
 
     public var address: String { return self.config.address }
     public var port: UInt16 { return self.config.port }
-    
+
     public init(config: RedbirdConfig = RedbirdConfig()) throws {
-		
+
         self.config = config
         self.socket = try ClientSocket(address: config.address, port: config.port)
         try self.preflight()
-	}
+    }
     
     private func preflight() throws {
         try self.authIfNeeded()
@@ -127,6 +127,10 @@ public class Redbird {
     public func pipeline() -> Pipeline {
         return Pipeline(config: self.config, socket: self.socket)
     }
+
+    public func pubsub() -> PubSub {
+        return PubSub(config: self.config, socket: self.socket)
+    }
 }
 
 public class Pipeline: Redbird {
@@ -153,7 +157,7 @@ public class Pipeline: Redbird {
         var ret: [RespObject]?
         
         try self.handleComms {
-            
+
             //send the command string
             try self.socket.write(string: formatted)
             
@@ -171,6 +175,59 @@ public class Pipeline: Redbird {
             ret = responses
         }
         return ret!
+    }
+}
+
+public class PubSub: Redbird {
+
+    var subscriptions: [String:[(_: RespObject) -> Void]] = [:]
+    var reading = false
+
+    public func subscribe(_ to: String, _ cb: (_: RespObject) -> Void) throws -> Void {
+        if var cbs = subscriptions[to] {
+            cbs.append(cb)
+            return
+        }
+        subscriptions[to] = [cb]
+
+        let resp = try self.command("SUBSCRIBE", params: [to]).toArray()
+        try print(resp[0].toString(), resp[1].toString(), resp[2].toInt())
+
+        if reading {
+            return
+        }
+
+        reading = true
+
+        try self.handleComms {
+            
+            //delegate reading to parsers
+            let reader: SocketReader = self.socket
+            
+            var leftovers = [Byte]()
+            while true {
+                //try to parse the string into a Resp object, fail if no parser accepts it
+                let (responseObject, los) = try InitialParser().parse(leftovers, reader: reader)
+                leftovers = los
+                if responseObject.respType == .Array {
+                    if let arr = try responseObject.toMaybeArray() {
+                        if arr[0].respType == .BulkString {
+                            if let str = try arr[0].toMaybeString() {
+                                if str == "message" {
+                                    if let channel = try arr[1].toMaybeString() {
+                                        if let callbacks = subscriptions[channel] {
+                                            for cb in callbacks {
+                                                cb(arr[2])
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
